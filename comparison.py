@@ -5,9 +5,7 @@ from sklearn.svm import LinearSVC
 import cvxpy as cp
 import time
 
-# ---------------------
-# Parameters (paper-like)
-# ---------------------
+# Parameters
 K = 4          # users
 N = 32         # BS antennas
 Tt = 20        # pilot length
@@ -17,9 +15,7 @@ num_trials = 60   # Monte Carlo trials (increase for smoother curves; paper used
 C_svm = 1.0       # SVM slack parameter
 C_qp = 1.0        # weight of slack in QP formulation (paper uses C)
 
-# ---------------------
-# Utilities
-# ---------------------
+
 def one_bit_quantize(X):
     return np.sign(X)
 
@@ -44,26 +40,21 @@ def generate_iid_channel(N, K):
 
 def generate_spatial_covariance(N, angle_spread_deg=10):
     # Simple Laplacian-like angular correlation approximation
-    # Using uniform sample of angles for a ULA-like model
     angles = np.linspace(-np.pi/2, np.pi/2, N)
     spread = np.deg2rad(angle_spread_deg)
     # pairwise Laplacian kernel
     C = np.exp(-np.abs(angles[:, None] - angles[None, :]) / spread)
-    # normalize (so average power is unity-ish)
-    C = C / np.max(np.real(np.linalg.eigvals(C)))
+    C = C / np.max(np.real(np.linalg.eigvals(C))) # normalize
     return C
 
 def complex_cov_to_real(Cbar):
     # Convert complex covariance Cbar (N x N) to real 2N x 2N form:
-    # [[Re(Cbar), -Im(Cbar)]; [Im(Cbar), Re(Cbar)]]
     return np.block([[np.real(Cbar), -np.imag(Cbar)], [np.imag(Cbar), np.real(Cbar)]])
 
 def generate_correlated_channel(N, K, Cbar):
     # generate Hc ~ CN(0, Cbar) per column
-    # We'll draw real and imag jointly using multivariate normal with cov Cbar
     Hc = np.zeros((N, K), dtype=complex)
     # Use eigen-decomposition to sample correlated complex Gaussian
-    # Cbar is Hermitian PSD
     vals, vecs = np.linalg.eigh(Cbar)
     vals = np.clip(vals, 0, None)
     sqrtC = vecs @ np.diag(np.sqrt(vals)) @ vecs.conj().T
@@ -76,11 +67,10 @@ def generate_correlated_channel(N, K, Cbar):
 def nmse(H_true, H_est):
     return np.linalg.norm(H_true - H_est, 'fro')**2 / (K * N)
 
-# ---------------------
+
 # Uncorrelated estimator (fast): per-row SVM
-# ---------------------
+
 def estimate_uncorrelated_svm(Yt, Xt, K, N, C=C_svm):
-    # Yt: (2N x 2Tt), Xt: (2K x 2Tt)
     H_est_real = np.zeros((2*N, 2*K))
     for i in range(2*N):
         labels = Yt[i, :]
@@ -97,36 +87,30 @@ def estimate_uncorrelated_svm(Yt, Xt, K, N, C=C_svm):
     Hc_est = H_est_real[:N, :K] + 1j * H_est_real[N:, :K]
     return Hc_est
 
-# ---------------------
+
 # Correct correlated estimator: joint convex QP via cvxpy
 # Solve Eq. (20) in real domain:
-# minimize 0.5 * sum_k hk^T Ck_inv hk + C * sum xi
-# s.t. y_{i,n} * (h_row_i^T x_n) >= 1 - xi_{i,n}, xi >= 0
-# where H is (2N x 2K) real variable; hk = H[:, k] for k=0..K-1
-# ---------------------
+
 def estimate_correlated_qp(Yt, Xt, K, N, Cbar, C_param=1.0, solver_prefer='OSQP'):
-    # Yt: (2N x 2Tt), Xt: (2K x 2Tt)
     twoN, twoK = 2*N, 2*K
     # Build real covariance for each user (assume same Cbar for each user)
-    Ck_real = complex_cov_to_real(Cbar)   # 2N x 2N
+    Ck_real = complex_cov_to_real(Cbar)
     # regularize and invert
     reg = 1e-8
     Ck_inv = np.linalg.inv(Ck_real + reg * np.eye(2*N))
 
-    # cvxpy variables
     H = cp.Variable((twoN, twoK))   # real representation
     xi = cp.Variable((twoN, 2*Tt), nonneg=True)
 
-    # objective: 0.5 * sum_k h_k^T Ck_inv h_k + C * sum(xi)
+    # objective: sum of quadratic forms + slack penalty
     quad_terms = []
-    # NOTE: hk corresponds to H[:, k] for k in 0..K-1 (first K columns)
     for k in range(K):
         hk = H[:, k]
         # use quadratic form with symmetric matrix Ck_inv
         quad_terms.append(cp.quad_form(hk, Ck_inv))
     obj = 0.5 * cp.sum(quad_terms) + C_param * cp.sum(xi)
 
-    # constraints: for each i (0..2N-1) and n (0..2Tt-1)
+    # constraints
     constraints = []
     Xt_cols = [Xt[:, n] for n in range(2*Tt)]
     for i in range(twoN):
@@ -165,9 +149,8 @@ def estimate_correlated_qp(Yt, Xt, K, N, Cbar, C_param=1.0, solver_prefer='OSQP'
     if not solved:
         raise RuntimeError("QP solver failed (tried OSQP/ECOS/SCS). Install OSQP/ECOS and retry.")
 
-    H_opt = H.value  # 2N x 2K
-    # normalize scaling step from paper: scale each column vector (hk) so that ||H||_F matches trace{Cbar}
-    # paper used H_hat = (trace{Cbar} / ||H_tilde||_F) * H_tilde
+    H_opt = H.value
+    # normalize
     H_tilde = H_opt
     scale_factor = np.trace(complex_cov_to_real(Cbar)) / (np.linalg.norm(H_tilde, 'fro') + 1e-12)
     H_hat = scale_factor * H_tilde
@@ -176,9 +159,9 @@ def estimate_correlated_qp(Yt, Xt, K, N, Cbar, C_param=1.0, solver_prefer='OSQP'
     Hc_hat = H_hat[:N, :K] + 1j * H_hat[N:, :K]
     return Hc_hat
 
-# ---------------------
+
 # Main Monte Carlo (compare methods)
-# ---------------------
+
 def main():
     Xt = generate_pilots(Tt, K)
     # prepare spatial covariance (complex)
@@ -201,9 +184,9 @@ def main():
             noise_std = np.sqrt(1/(2*snr))
             Z = noise_std * np.random.randn(2*N, 2*Tt)
 
-            Yt = one_bit_quantize(Hreal_corr @ Xt + Z)  # quantized pilot measurements (2N x 2Tt)
+            Yt = one_bit_quantize(Hreal_corr @ Xt + Z)  # quantized pilot measurements
 
-            # Uncorrelated SVM estimator (per-row SVM) -- note: this estimator ignores correlation
+            # Uncorrelated SVM estimator
             H_est_u = estimate_uncorrelated_svm(Yt, Xt, K, N, C=C_svm)
             errs_u.append(nmse(Hc_true, H_est_u))
 
